@@ -3,8 +3,9 @@
 
 -- ============ ENUMS ============
 CREATE TYPE user_tier AS ENUM ('individual', 'nri', 'corporate', 'field_force');
+CREATE TYPE user_role AS ENUM ('customer', 'staff');
 CREATE TYPE service_category AS ENUM ('ac', 'ro', 'plumbing', 'carpentry', 'painting', 'nri_property', 'movers', 'amc');
-CREATE TYPE ticket_status AS ENUM ('open', 'assigned', 'en_route', 'in_progress', 'awaiting_qc', 'rework', 'qc_passed', 'closed');
+CREATE TYPE ticket_status AS ENUM ('pending', 'assigned', 'open', 'en_route', 'in_progress', 'awaiting_qc', 'rework', 'qc_passed', 'closed');
 CREATE TYPE payment_mode AS ENUM ('upi', 'card', 'pay_later', 'cod');
 CREATE TYPE payment_status AS ENUM ('pending', 'completed', 'failed', 'refunded');
 CREATE TYPE qc_verdict AS ENUM ('passed', 'rework_needed', 'dispute_raised');
@@ -15,6 +16,7 @@ CREATE TABLE user_profiles (
   id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
   user_id UUID NOT NULL UNIQUE REFERENCES auth.users(id) ON DELETE CASCADE,
   phone TEXT NOT NULL UNIQUE,
+  role user_role NOT NULL DEFAULT 'customer',
   tier user_tier NOT NULL,
   full_name TEXT NOT NULL,
   email TEXT NOT NULL,
@@ -30,10 +32,12 @@ CREATE TABLE user_profiles (
   created_at TIMESTAMP DEFAULT NOW(),
   updated_at TIMESTAMP DEFAULT NOW(),
   
-  CONSTRAINT valid_tier CHECK (tier IN ('individual', 'nri', 'corporate', 'field_force'))
+  CONSTRAINT valid_tier CHECK (tier IN ('individual', 'nri', 'corporate', 'field_force')),
+  CONSTRAINT staff_requires_kyc CHECK (role <> 'staff' OR kyc_doc_url IS NOT NULL)
 );
 
 CREATE INDEX idx_user_profiles_phone ON user_profiles(phone);
+CREATE INDEX idx_user_profiles_role ON user_profiles(role);
 CREATE INDEX idx_user_profiles_tier ON user_profiles(tier);
 CREATE INDEX idx_user_profiles_city ON user_profiles(city);
 
@@ -107,11 +111,11 @@ CREATE INDEX idx_assets_qr ON assets(qr_code);
 -- ============ SERVICE REQUESTS (Tickets) ============
 CREATE TABLE service_requests (
   id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
-  ticket_id TEXT UNIQUE DEFAULT ('TKT-' || DATE_FORMAT(NOW(), '%y%m%d') || '-' || LPAD(CAST(FLOOR(RAND() * 10000) AS CHAR), 4, '0')),
+  ticket_id TEXT UNIQUE DEFAULT ('TKT-' || TO_CHAR(NOW(), 'YYMMDD') || '-' || LPAD((FLOOR(RANDOM() * 10000))::INT::TEXT, 4, '0')),
   user_id UUID NOT NULL REFERENCES user_profiles(user_id) ON DELETE CASCADE,
   asset_id UUID REFERENCES assets(id) ON DELETE SET NULL,
   category service_category NOT NULL,
-  status ticket_status DEFAULT 'open',
+  status ticket_status DEFAULT 'pending',
   description TEXT,
   issue_photos TEXT[], -- array of R2 URLs
   issue_latitude DECIMAL(10, 8),
@@ -123,6 +127,7 @@ CREATE TABLE service_requests (
   revised_quote DECIMAL(10, 2),
   revision_reason TEXT,
   revision_approved BOOLEAN,
+  assigned_to UUID REFERENCES user_profiles(user_id) ON DELETE SET NULL,
   assigned_agent_id UUID REFERENCES field_agents(id) ON DELETE SET NULL,
   assignment_count INT DEFAULT 0,
   before_photos TEXT[], -- after assignment
@@ -138,6 +143,8 @@ CREATE TABLE service_requests (
 
 CREATE INDEX idx_service_requests_user ON service_requests(user_id);
 CREATE INDEX idx_service_requests_status ON service_requests(status);
+CREATE INDEX idx_service_requests_pending_jobs ON service_requests(status, created_at) WHERE assigned_to IS NULL;
+CREATE INDEX idx_service_requests_assigned_to ON service_requests(assigned_to);
 CREATE INDEX idx_service_requests_agent ON service_requests(assigned_agent_id);
 CREATE INDEX idx_service_requests_category ON service_requests(category);
 
@@ -267,22 +274,132 @@ ALTER TABLE maintenance_schedule ENABLE ROW LEVEL SECURITY;
 ALTER TABLE loyalty_points ENABLE ROW LEVEL SECURITY;
 ALTER TABLE loyalty_transactions ENABLE ROW LEVEL SECURITY;
 
+-- Storage bucket for persisted KYC documents
+INSERT INTO storage.buckets (id, name, public)
+VALUES ('kyc-documents', 'kyc-documents', FALSE)
+ON CONFLICT (id) DO NOTHING;
+
+CREATE POLICY "Users upload own KYC documents" ON storage.objects
+  FOR INSERT WITH CHECK (
+    bucket_id = 'kyc-documents'
+    AND auth.uid()::TEXT = (storage.foldername(name))[1]
+  );
+
+CREATE POLICY "Users view own KYC documents" ON storage.objects
+  FOR SELECT USING (
+    bucket_id = 'kyc-documents'
+    AND auth.uid()::TEXT = (storage.foldername(name))[1]
+  );
+
+CREATE OR REPLACE FUNCTION enforce_profile_verification_control()
+RETURNS TRIGGER AS $$
+BEGIN
+  IF TG_OP = 'INSERT' AND auth.uid() = NEW.user_id THEN
+    NEW.kyc_verified = FALSE;
+    NEW.profile_verified = FALSE;
+  END IF;
+
+  IF TG_OP = 'UPDATE' AND auth.uid() = NEW.user_id THEN
+    NEW.role = OLD.role;
+    NEW.kyc_verified = OLD.kyc_verified;
+    NEW.profile_verified = OLD.profile_verified;
+  END IF;
+
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER user_profiles_protect_verification
+  BEFORE INSERT OR UPDATE ON user_profiles
+  FOR EACH ROW
+  EXECUTE FUNCTION enforce_profile_verification_control();
+
 -- Policy: Users can only view their own profile
 CREATE POLICY "Users view own profile" ON user_profiles
   FOR SELECT USING (auth.uid() = user_id);
 
+CREATE POLICY "Users insert own profile" ON user_profiles
+  FOR INSERT WITH CHECK (
+    auth.uid() = user_id
+    AND kyc_verified = FALSE
+    AND profile_verified = FALSE
+  );
+
 CREATE POLICY "Users update own profile" ON user_profiles
-  FOR UPDATE USING (auth.uid() = user_id);
+  FOR UPDATE USING (auth.uid() = user_id)
+  WITH CHECK (
+    auth.uid() = user_id
+    AND role = (SELECT role FROM user_profiles WHERE user_id = auth.uid())
+  );
 
 -- Policy: Users can view their own service requests
 CREATE POLICY "Users view own requests" ON service_requests
   FOR SELECT USING (auth.uid() = user_id);
 
+CREATE POLICY "Staff view pending requests" ON service_requests
+  FOR SELECT USING (
+    status = 'pending'
+    AND assigned_to IS NULL
+    AND EXISTS (
+      SELECT 1 FROM user_profiles
+      WHERE user_id = auth.uid()
+      AND role = 'staff'
+      AND kyc_verified IS TRUE
+    )
+  );
+
+CREATE POLICY "Staff view assigned requests" ON service_requests
+  FOR SELECT USING (
+    assigned_to = auth.uid()
+    AND EXISTS (
+      SELECT 1 FROM user_profiles
+      WHERE user_id = auth.uid()
+      AND role = 'staff'
+      AND kyc_verified IS TRUE
+    )
+  );
+
 CREATE POLICY "Users create own requests" ON service_requests
   FOR INSERT WITH CHECK (auth.uid() = user_id);
 
-CREATE POLICY "Users update own requests" ON service_requests
-  FOR UPDATE USING (auth.uid() = user_id);
+CREATE OR REPLACE FUNCTION claim_service_request(request_id UUID)
+RETURNS SETOF service_requests
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  requester UUID := auth.uid();
+BEGIN
+  IF requester IS NULL THEN
+    RAISE EXCEPTION 'Authentication required';
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1 FROM user_profiles
+    WHERE user_id = requester
+    AND role = 'staff'
+    AND kyc_verified IS TRUE
+  ) THEN
+    RAISE EXCEPTION 'Verified staff profile required';
+  END IF;
+
+  RETURN QUERY
+  UPDATE public.service_requests
+  SET
+    assigned_to = requester,
+    status = 'assigned',
+    updated_at = NOW()
+  WHERE id = request_id
+    AND status = 'pending'
+    AND assigned_to IS NULL
+  RETURNING *;
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION claim_service_request(UUID) TO authenticated;
+
+REVOKE UPDATE ON service_requests FROM authenticated;
 
 -- Policy: Users can view their own assets
 CREATE POLICY "Users view own assets" ON assets
@@ -301,10 +418,6 @@ CREATE POLICY "Agents view assigned tickets" ON service_requests
       SELECT id FROM field_agents WHERE user_id = auth.uid()
     )
   );
-
--- Policy: QC team can view all tickets (implement role check if needed)
-CREATE POLICY "QC view all tickets" ON service_requests
-  FOR SELECT USING (TRUE); -- TODO: restrict to QC role
 
 -- ============ TRIGGERS (auto-update timestamps) ============
 
