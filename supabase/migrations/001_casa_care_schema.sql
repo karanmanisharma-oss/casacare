@@ -293,10 +293,19 @@ CREATE POLICY "Users view own requests" ON service_requests
   FOR SELECT USING (auth.uid() = user_id);
 
 CREATE POLICY "Users create own requests" ON service_requests
-  FOR INSERT WITH CHECK (auth.uid() = user_id);
+  FOR INSERT WITH CHECK (
+    auth.uid() = user_id
+    AND assigned_to IS NULL
+    AND assigned_agent_id IS NULL
+  );
 
 CREATE POLICY "Users update own requests" ON service_requests
-  FOR UPDATE USING (auth.uid() = user_id);
+  FOR UPDATE USING (auth.uid() = user_id)
+  WITH CHECK (
+    auth.uid() = user_id
+    AND assigned_to IS NULL
+    AND assigned_agent_id IS NULL
+  );
 
 -- Policy: Users can view their own assets
 CREATE POLICY "Users view own assets" ON assets
@@ -374,6 +383,42 @@ $$ LANGUAGE plpgsql;
 
 REVOKE EXECUTE ON FUNCTION prevent_user_role_escalation() FROM PUBLIC;
 
+CREATE OR REPLACE FUNCTION prevent_unauthorized_service_request_assignment()
+RETURNS TRIGGER AS $$
+BEGIN
+  IF current_user IN ('postgres', 'service_role') THEN
+    RETURN NEW;
+  END IF;
+
+  IF NEW.assigned_agent_id IS DISTINCT FROM OLD.assigned_agent_id THEN
+    RAISE EXCEPTION 'Only service role can change assigned agents';
+  END IF;
+
+  IF NEW.assigned_to IS DISTINCT FROM OLD.assigned_to THEN
+    IF OLD.assigned_to IS NOT NULL THEN
+      RAISE EXCEPTION 'Assigned service requests cannot be reassigned by users';
+    END IF;
+
+    IF NEW.assigned_to IS DISTINCT FROM auth.uid() THEN
+      RAISE EXCEPTION 'Only staff can claim service requests for themselves';
+    END IF;
+
+    IF NOT EXISTS (
+      SELECT 1
+      FROM user_profiles
+      WHERE user_profiles.user_id = auth.uid()
+        AND user_profiles.role = 'staff'
+    ) THEN
+      RAISE EXCEPTION 'Only staff can claim service requests';
+    END IF;
+  END IF;
+
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+REVOKE EXECUTE ON FUNCTION prevent_unauthorized_service_request_assignment() FROM PUBLIC;
+
 CREATE TRIGGER user_profiles_updated_at
   BEFORE UPDATE ON user_profiles
   FOR EACH ROW
@@ -393,6 +438,11 @@ CREATE TRIGGER service_requests_updated_at
   BEFORE UPDATE ON service_requests
   FOR EACH ROW
   EXECUTE FUNCTION update_updated_at();
+
+CREATE TRIGGER service_requests_prevent_unauthorized_assignment
+  BEFORE UPDATE OF assigned_to, assigned_agent_id ON service_requests
+  FOR EACH ROW
+  EXECUTE FUNCTION prevent_unauthorized_service_request_assignment();
 
 -- ============ SEEDING: Mock Agents ============
 

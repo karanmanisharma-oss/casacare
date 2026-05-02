@@ -13,6 +13,25 @@ WHERE status = 'open'
 
 DROP POLICY IF EXISTS "QC view all tickets" ON service_requests;
 
+DROP POLICY IF EXISTS "Users create own requests" ON service_requests;
+CREATE POLICY "Users create own requests"
+ON service_requests FOR INSERT
+WITH CHECK (
+  auth.uid() = user_id
+  AND assigned_to IS NULL
+  AND assigned_agent_id IS NULL
+);
+
+DROP POLICY IF EXISTS "Users update own requests" ON service_requests;
+CREATE POLICY "Users update own requests"
+ON service_requests FOR UPDATE
+USING (auth.uid() = user_id)
+WITH CHECK (
+  auth.uid() = user_id
+  AND assigned_to IS NULL
+  AND assigned_agent_id IS NULL
+);
+
 DROP POLICY IF EXISTS "Staff can view available service requests" ON service_requests;
 CREATE POLICY "Staff can view available service requests"
 ON service_requests FOR SELECT
