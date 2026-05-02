@@ -46,9 +46,9 @@ UPDATE public.pet_services
 SET
   service_code = COALESCE(
     service_code,
-    'PET_' || upper(regexp_replace(COALESCE(kind::TEXT, name, service_name, id::TEXT), '[^a-zA-Z0-9]+', '_', 'g'))
+    'PET_' || upper(regexp_replace(COALESCE(kind::TEXT, name, service_name, '') || '_' || id::TEXT, '[^a-zA-Z0-9]+', '_', 'g'))
   ),
-  service_name = COALESCE(service_name, name),
+  service_name = COALESCE(service_name, name, 'Service ' || COALESCE(kind::TEXT, id::TEXT)),
   name = COALESCE(name, service_name),
   base_price = COALESCE(base_price, base_price_inr::NUMERIC),
   duration_minutes = COALESCE(duration_minutes, duration_min),
