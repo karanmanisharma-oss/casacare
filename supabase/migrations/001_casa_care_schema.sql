@@ -4,11 +4,12 @@
 -- ============ ENUMS ============
 CREATE TYPE user_tier AS ENUM ('individual', 'nri', 'corporate', 'field_force');
 CREATE TYPE service_category AS ENUM ('ac', 'ro', 'plumbing', 'carpentry', 'painting', 'nri_property', 'movers', 'amc');
-CREATE TYPE ticket_status AS ENUM ('open', 'assigned', 'en_route', 'in_progress', 'awaiting_qc', 'rework', 'qc_passed', 'closed');
+CREATE TYPE ticket_status AS ENUM ('pending', 'open', 'assigned', 'en_route', 'in_progress', 'awaiting_qc', 'rework', 'qc_passed', 'closed');
 CREATE TYPE payment_mode AS ENUM ('upi', 'card', 'pay_later', 'cod');
 CREATE TYPE payment_status AS ENUM ('pending', 'completed', 'failed', 'refunded');
 CREATE TYPE qc_verdict AS ENUM ('passed', 'rework_needed', 'dispute_raised');
 CREATE TYPE language AS ENUM ('en', 'hi', 'ta', 'te', 'kn', 'ml', 'gu', 'mr', 'pa', 'bn', 'or', 'as', 'ne', 'si', 'ur');
+CREATE TYPE user_role AS ENUM ('user', 'nri', 'corporate', 'staff');
 
 -- ============ USERS & PROFILES ============
 CREATE TABLE user_profiles (
@@ -19,6 +20,7 @@ CREATE TABLE user_profiles (
   full_name TEXT NOT NULL,
   email TEXT NOT NULL,
   address TEXT NOT NULL,
+  role user_role DEFAULT 'user',
   city TEXT,
   zip_code TEXT,
   latitude DECIMAL(10, 8),
@@ -105,13 +107,20 @@ CREATE INDEX idx_assets_user ON assets(user_id);
 CREATE INDEX idx_assets_qr ON assets(qr_code);
 
 -- ============ SERVICE REQUESTS (Tickets) ============
+CREATE OR REPLACE FUNCTION generate_ticket_id()
+RETURNS TEXT AS $$
+BEGIN
+  RETURN 'CASA-' || TO_CHAR(NOW(), 'YYYYMMDD') || '-' || UPPER(SUBSTR(MD5(RANDOM()::TEXT), 1, 6));
+END;
+$$ LANGUAGE plpgsql;
+
 CREATE TABLE service_requests (
   id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
-  ticket_id TEXT UNIQUE DEFAULT ('TKT-' || DATE_FORMAT(NOW(), '%y%m%d') || '-' || LPAD(CAST(FLOOR(RAND() * 10000) AS CHAR), 4, '0')),
+  ticket_id TEXT UNIQUE DEFAULT generate_ticket_id(),
   user_id UUID NOT NULL REFERENCES user_profiles(user_id) ON DELETE CASCADE,
   asset_id UUID REFERENCES assets(id) ON DELETE SET NULL,
   category service_category NOT NULL,
-  status ticket_status DEFAULT 'open',
+  status ticket_status DEFAULT 'pending',
   description TEXT,
   issue_photos TEXT[], -- array of R2 URLs
   issue_latitude DECIMAL(10, 8),
@@ -123,6 +132,7 @@ CREATE TABLE service_requests (
   revised_quote DECIMAL(10, 2),
   revision_reason TEXT,
   revision_approved BOOLEAN,
+  assigned_to UUID REFERENCES auth.users(id) ON DELETE SET NULL,
   assigned_agent_id UUID REFERENCES field_agents(id) ON DELETE SET NULL,
   assignment_count INT DEFAULT 0,
   before_photos TEXT[], -- after assignment
@@ -138,6 +148,7 @@ CREATE TABLE service_requests (
 
 CREATE INDEX idx_service_requests_user ON service_requests(user_id);
 CREATE INDEX idx_service_requests_status ON service_requests(status);
+CREATE INDEX idx_service_requests_assigned_to ON service_requests(assigned_to);
 CREATE INDEX idx_service_requests_agent ON service_requests(assigned_agent_id);
 CREATE INDEX idx_service_requests_category ON service_requests(category);
 
@@ -271,6 +282,9 @@ ALTER TABLE loyalty_transactions ENABLE ROW LEVEL SECURITY;
 CREATE POLICY "Users view own profile" ON user_profiles
   FOR SELECT USING (auth.uid() = user_id);
 
+CREATE POLICY "Users can create their own profile" ON user_profiles
+  FOR INSERT WITH CHECK (auth.uid() = user_id AND role = 'user');
+
 CREATE POLICY "Users update own profile" ON user_profiles
   FOR UPDATE USING (auth.uid() = user_id);
 
@@ -302,9 +316,32 @@ CREATE POLICY "Agents view assigned tickets" ON service_requests
     )
   );
 
--- Policy: QC team can view all tickets (implement role check if needed)
-CREATE POLICY "QC view all tickets" ON service_requests
-  FOR SELECT USING (TRUE); -- TODO: restrict to QC role
+CREATE POLICY "Staff can view available service requests" ON service_requests
+  FOR SELECT USING (
+    status = 'pending'
+    AND EXISTS (
+      SELECT 1
+      FROM user_profiles
+      WHERE user_profiles.user_id = auth.uid()
+        AND user_profiles.role = 'staff'
+    )
+  );
+
+CREATE POLICY "Staff can claim a job" ON service_requests
+  FOR UPDATE USING (
+    status = 'pending'
+    AND assigned_to IS NULL
+    AND EXISTS (
+      SELECT 1
+      FROM user_profiles
+      WHERE user_profiles.user_id = auth.uid()
+        AND user_profiles.role = 'staff'
+    )
+  )
+  WITH CHECK (
+    status = 'pending'
+    AND assigned_to = auth.uid()
+  );
 
 -- ============ TRIGGERS (auto-update timestamps) ============
 
@@ -316,10 +353,36 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+CREATE OR REPLACE FUNCTION prevent_user_role_escalation()
+RETURNS TRIGGER AS $$
+BEGIN
+  IF current_user IN ('postgres', 'service_role') THEN
+    RETURN NEW;
+  END IF;
+
+  IF TG_OP = 'INSERT' AND NEW.role <> 'user' THEN
+    RAISE EXCEPTION 'Users cannot assign elevated profile roles';
+  END IF;
+
+  IF TG_OP = 'UPDATE' AND NEW.role IS DISTINCT FROM OLD.role THEN
+    RAISE EXCEPTION 'Users cannot change profile roles';
+  END IF;
+
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+REVOKE EXECUTE ON FUNCTION prevent_user_role_escalation() FROM PUBLIC;
+
 CREATE TRIGGER user_profiles_updated_at
   BEFORE UPDATE ON user_profiles
   FOR EACH ROW
   EXECUTE FUNCTION update_updated_at();
+
+CREATE TRIGGER user_profiles_prevent_role_escalation
+  BEFORE INSERT OR UPDATE OF role ON user_profiles
+  FOR EACH ROW
+  EXECUTE FUNCTION prevent_user_role_escalation();
 
 CREATE TRIGGER assets_updated_at
   BEFORE UPDATE ON assets
