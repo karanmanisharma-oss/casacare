@@ -41,3 +41,5 @@ Without these, the app renders all UI but Supabase API calls (auth, data) will f
 - Phone OTP auth (the only auth method) requires a configured SMS provider (Twilio/Vonage) in the Supabase dashboard. Without it, the auth flow won't work even with valid Supabase credentials.
 - The SQL migration file uses some MySQL-isms (`DATE_FORMAT`, `RAND`, `LPAD`, `CAST ... AS CHAR`) in the `service_requests.ticket_id` default. These will fail on a real Supabase (PostgreSQL) database; use PostgreSQL equivalents if running the migration.
 - `CREATE TABLE IF NOT EXISTS` does not reconcile existing tables. For evolved schemas, add explicit `ALTER TABLE ... ADD COLUMN IF NOT EXISTS ...` statements, backfill legacy/new columns, then add constraints.
+- In Cloud Agent VMs, Node.js is available via nvm at `/home/ubuntu/.nvm`. Source it before running npm commands: `export NVM_DIR="/home/ubuntu/.nvm" && [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"`. The update script handles this automatically.
+- No `package-lock.json` is committed; `npm install` resolves versions fresh each run.
