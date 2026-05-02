@@ -1,6 +1,6 @@
 # 🔐 Casa Care Autopilot — Secrets Checklist
 
-## Quick Setup (5 Minutes)
+## Quick Setup
 
 ### What You Need to Create
 
@@ -22,7 +22,7 @@
 
 ### Add to GitHub Actions Secrets
 
-**Go to:** https://github.com/karanmanisharma-oss/casa-care/settings/secrets/actions
+**Go to:** https://github.com/karanmanisharma-oss/casacare/settings/secrets/actions
 
 **Click "New repository secret" and add each:**
 
@@ -43,7 +43,7 @@ Value: [paste from Supabase database settings]
 
 ### Verify
 
-Go to: https://github.com/karanmanisharma-oss/casa-care/settings/secrets/actions
+Go to: https://github.com/karanmanisharma-oss/casacare/settings/secrets/actions
 
 You should see all 3 secrets listed:
 - ✅ SUPABASE_ACCESS_TOKEN

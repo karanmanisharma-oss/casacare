@@ -8,6 +8,13 @@ Automated deployment pipeline for Casa Care with GitHub Actions + Supabase + Ver
 2. **Create migrations** in `supabase/migrations/`
 3. **Push to main** → auto-deployment
 
+## Source of Truth
+
+- GitHub repo: `https://github.com/karanmanisharma-oss/casacare`
+- Supabase project: `casacare` (`dkgthfdvuulytfancwes`)
+- App tables belong in the `public` schema unless the frontend and Supabase API exposure settings are intentionally changed together.
+- Do not deploy this app's migrations to `Casa Care Launch` (`bxwvcsjqduxmecvnddzu`); it contains unrelated healthcare tables and is not the canonical backend for this repo.
+
 ## Autopilot Workflows
 
 - **CI** — Runs on every PR to main

@@ -15,7 +15,7 @@ Your `casa-care` repository is now ready with automated deployment pipelines.
 
 ### Step 1: Create GitHub Secrets
 
-**Go to:** https://github.com/karanmanisharma-oss/casa-care/settings/secrets/actions
+**Go to:** https://github.com/karanmanisharma-oss/casacare/settings/secrets/actions
 
 **Click "New repository secret" and add these 3 secrets:**
 
@@ -27,7 +27,7 @@ Your `casa-care` repository is now ready with automated deployment pipelines.
 
 ### Step 2: Verify Workflows
 
-**Go to:** https://github.com/karanmanisharma-oss/casa-care/actions
+**Go to:** https://github.com/karanmanisharma-oss/casacare/actions
 
 You should see:
 - ✅ `CI` workflow
@@ -43,7 +43,7 @@ You should see:
 
 ### Step 4: Create Branch Protection (Recommended)
 
-**Go to:** https://github.com/karanmanisharma-oss/casa-care/settings/branches
+**Go to:** https://github.com/karanmanisharma-oss/casacare/settings/branches
 
 - Click "Add rule"
 - Branch name: `main`
