@@ -2,13 +2,15 @@
 -- Paste this entire file into Supabase SQL Editor and run
 
 -- ============ ENUMS ============
-CREATE TYPE user_tier AS ENUM ('individual', 'nri', 'corporate', 'field_force');
+CREATE TYPE user_tier AS ENUM ('individual', 'nri', 'corporate', 'field_force', 'staff_professional');
 CREATE TYPE service_category AS ENUM ('ac', 'ro', 'plumbing', 'carpentry', 'painting', 'nri_property', 'movers', 'amc');
 CREATE TYPE ticket_status AS ENUM ('open', 'assigned', 'en_route', 'in_progress', 'awaiting_qc', 'rework', 'qc_passed', 'closed');
 CREATE TYPE payment_mode AS ENUM ('upi', 'card', 'pay_later', 'cod');
 CREATE TYPE payment_status AS ENUM ('pending', 'completed', 'failed', 'refunded');
 CREATE TYPE qc_verdict AS ENUM ('passed', 'rework_needed', 'dispute_raised');
 CREATE TYPE language AS ENUM ('en', 'hi', 'ta', 'te', 'kn', 'ml', 'gu', 'mr', 'pa', 'bn', 'or', 'as', 'ne', 'si', 'ur');
+CREATE TYPE verification_status AS ENUM ('pending', 'submitted', 'verified', 'rejected');
+CREATE TYPE professional_availability AS ENUM ('available', 'busy', 'offline');
 
 -- ============ USERS & PROFILES ============
 CREATE TABLE user_profiles (
@@ -27,10 +29,13 @@ CREATE TABLE user_profiles (
   kyc_doc_url TEXT, -- for NRI/Corporate
   kyc_verified BOOLEAN DEFAULT FALSE,
   profile_verified BOOLEAN DEFAULT FALSE,
+  skills service_category[] DEFAULT '{}',
+  verification_status verification_status DEFAULT 'pending',
+  availability professional_availability DEFAULT 'offline',
   created_at TIMESTAMP DEFAULT NOW(),
   updated_at TIMESTAMP DEFAULT NOW(),
   
-  CONSTRAINT valid_tier CHECK (tier IN ('individual', 'nri', 'corporate', 'field_force'))
+  CONSTRAINT valid_tier CHECK (tier IN ('individual', 'nri', 'corporate', 'field_force', 'staff_professional'))
 );
 
 CREATE INDEX idx_user_profiles_phone ON user_profiles(phone);
@@ -45,7 +50,7 @@ CREATE TABLE field_agents (
   phone TEXT UNIQUE,
   email TEXT,
   categories service_category[] NOT NULL, -- certified categories
-  availability_status TEXT DEFAULT 'available', -- available | busy | offline
+  availability_status professional_availability DEFAULT 'available',
   current_latitude DECIMAL(10, 8),
   current_longitude DECIMAL(11, 8),
   rating DECIMAL(3, 2) DEFAULT 5.0, -- average customer rating
@@ -107,7 +112,7 @@ CREATE INDEX idx_assets_qr ON assets(qr_code);
 -- ============ SERVICE REQUESTS (Tickets) ============
 CREATE TABLE service_requests (
   id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
-  ticket_id TEXT UNIQUE DEFAULT ('TKT-' || DATE_FORMAT(NOW(), '%y%m%d') || '-' || LPAD(CAST(FLOOR(RAND() * 10000) AS CHAR), 4, '0')),
+  ticket_id TEXT UNIQUE DEFAULT ('TKT-' || to_char(NOW(), 'YYMMDD') || '-' || upper(substr(replace(gen_random_uuid()::text, '-', ''), 1, 8))),
   user_id UUID NOT NULL REFERENCES user_profiles(user_id) ON DELETE CASCADE,
   asset_id UUID REFERENCES assets(id) ON DELETE SET NULL,
   category service_category NOT NULL,
@@ -271,8 +276,11 @@ ALTER TABLE loyalty_transactions ENABLE ROW LEVEL SECURITY;
 CREATE POLICY "Users view own profile" ON user_profiles
   FOR SELECT USING (auth.uid() = user_id);
 
+CREATE POLICY "Users create own profile" ON user_profiles
+  FOR INSERT WITH CHECK (auth.uid() = user_id);
+
 CREATE POLICY "Users update own profile" ON user_profiles
-  FOR UPDATE USING (auth.uid() = user_id);
+  FOR UPDATE USING (auth.uid() = user_id) WITH CHECK (auth.uid() = user_id);
 
 -- Policy: Users can view their own service requests
 CREATE POLICY "Users view own requests" ON service_requests
@@ -282,7 +290,7 @@ CREATE POLICY "Users create own requests" ON service_requests
   FOR INSERT WITH CHECK (auth.uid() = user_id);
 
 CREATE POLICY "Users update own requests" ON service_requests
-  FOR UPDATE USING (auth.uid() = user_id);
+  FOR UPDATE USING (auth.uid() = user_id) WITH CHECK (auth.uid() = user_id);
 
 -- Policy: Users can view their own assets
 CREATE POLICY "Users view own assets" ON assets
@@ -292,7 +300,26 @@ CREATE POLICY "Users manage own assets" ON assets
   FOR INSERT WITH CHECK (auth.uid() = user_id);
 
 CREATE POLICY "Users update own assets" ON assets
-  FOR UPDATE USING (auth.uid() = user_id);
+  FOR UPDATE USING (auth.uid() = user_id) WITH CHECK (auth.uid() = user_id);
+
+-- Policy: Professionals can manage their own provider profile.
+CREATE POLICY "Professionals view own field agent profile" ON field_agents
+  FOR SELECT USING (auth.uid() = user_id);
+
+CREATE POLICY "Professionals create own field agent profile" ON field_agents
+  FOR INSERT WITH CHECK (auth.uid() = user_id);
+
+CREATE POLICY "Professionals update own field agent profile" ON field_agents
+  FOR UPDATE USING (auth.uid() = user_id) WITH CHECK (auth.uid() = user_id);
+
+-- Policy: Professionals can discover local open jobs and see accepted work.
+CREATE POLICY "Professionals view open and assigned tickets" ON service_requests
+  FOR SELECT USING (
+    status = 'open'
+    OR assigned_agent_id = (
+      SELECT id FROM field_agents WHERE user_id = auth.uid()
+    )
+  );
 
 -- Policy: Agents can view their assigned tickets
 CREATE POLICY "Agents view assigned tickets" ON service_requests
@@ -302,9 +329,41 @@ CREATE POLICY "Agents view assigned tickets" ON service_requests
     )
   );
 
--- Policy: QC team can view all tickets (implement role check if needed)
-CREATE POLICY "QC view all tickets" ON service_requests
-  FOR SELECT USING (TRUE); -- TODO: restrict to QC role
+-- Policy: Professionals can accept open jobs and update accepted work.
+CREATE POLICY "Professionals accept and update assigned tickets" ON service_requests
+  FOR UPDATE USING (
+    status = 'open'
+    OR assigned_agent_id = (
+      SELECT id FROM field_agents WHERE user_id = auth.uid()
+    )
+  )
+  WITH CHECK (
+    assigned_agent_id = (
+      SELECT id FROM field_agents WHERE user_id = auth.uid()
+    )
+  );
+
+-- ============ STORAGE ============
+
+INSERT INTO storage.buckets (id, name, public)
+VALUES ('kyc-documents', 'kyc-documents', FALSE)
+ON CONFLICT (id) DO NOTHING;
+
+CREATE POLICY "Users upload own KYC documents" ON storage.objects
+  FOR INSERT
+  TO authenticated
+  WITH CHECK (
+    bucket_id = 'kyc-documents'
+    AND (storage.foldername(name))[1] = (SELECT auth.uid()::text)
+  );
+
+CREATE POLICY "Users read own KYC documents" ON storage.objects
+  FOR SELECT
+  TO authenticated
+  USING (
+    bucket_id = 'kyc-documents'
+    AND owner_id = (SELECT auth.uid()::text)
+  );
 
 -- ============ TRIGGERS (auto-update timestamps) ============
 
