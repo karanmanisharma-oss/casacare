@@ -22,7 +22,7 @@ ALTER TYPE user_role ADD VALUE IF NOT EXISTS 'staff';
 ALTER TABLE user_profiles
   ADD COLUMN IF NOT EXISTS role user_role DEFAULT 'user';
 
-ALTER TYPE ticket_status ADD VALUE IF NOT EXISTS 'pending';
+ALTER TYPE ticket_status ADD VALUE IF NOT EXISTS 'pending' BEFORE 'open';
 
 ALTER TABLE service_requests
   ADD COLUMN IF NOT EXISTS assigned_to UUID REFERENCES auth.users(id) ON DELETE SET NULL;

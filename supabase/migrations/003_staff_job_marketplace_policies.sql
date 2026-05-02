@@ -5,6 +5,14 @@
 ALTER TABLE service_requests
   ALTER COLUMN status SET DEFAULT 'pending';
 
+UPDATE service_requests
+SET status = 'pending'
+WHERE status = 'open'
+  AND assigned_agent_id IS NULL
+  AND assigned_to IS NULL;
+
+DROP POLICY IF EXISTS "QC view all tickets" ON service_requests;
+
 DROP POLICY IF EXISTS "Staff can view available service requests" ON service_requests;
 CREATE POLICY "Staff can view available service requests"
 ON service_requests FOR SELECT
