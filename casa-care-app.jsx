@@ -1,15 +1,63 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { createClient } from '@supabase/supabase-js';
+import {
+  SERVICE_CATEGORIES,
+  buildKycStoragePath,
+  buildProfilePayload,
+  getDashboardView,
+  isProfessionalTier,
+} from './src/casaCareLogic';
 
 // Supabase Client (Money will add real env vars when deploying)
-const supabaseUrl = process.env.REACT_APP_SUPABASE_URL || 'YOUR_SUPABASE_URL';
-const supabaseKey = process.env.REACT_APP_SUPABASE_ANON_KEY || 'YOUR_SUPABASE_KEY';
+const supabaseUrl = import.meta.env.VITE_SUPABASE_URL || 'https://placeholder.supabase.co';
+const supabaseKey = import.meta.env.VITE_SUPABASE_ANON_KEY || 'placeholder-anon-key-1234567890abcdef';
 const supabase = createClient(supabaseUrl, supabaseKey);
+const isDemoMode = supabaseUrl.includes('placeholder.supabase.co') || supabaseKey.startsWith('placeholder-');
+const DEMO_USER_ID = '00000000-0000-4000-8000-000000000001';
+const DEMO_AGENT_ID = '00000000-0000-4000-8000-000000000002';
+
+const demoJobs = [
+  {
+    id: 'job-ac-001',
+    ticket_id: 'TKT-DEMO-AC',
+    category: 'ac',
+    description: 'Split AC not cooling in Indiranagar apartment',
+    service_address: '12 100 Feet Road, Indiranagar, Bengaluru',
+    estimated_price: 900,
+    assignment_count: 0,
+    preferred_slot_start: new Date(Date.now() + 86400000).toISOString(),
+    status: 'open',
+  },
+  {
+    id: 'job-plumbing-002',
+    ticket_id: 'TKT-DEMO-PLUMB',
+    category: 'plumbing',
+    description: 'Kitchen sink leak needs same-day repair',
+    service_address: '44 Brigade Road, Bengaluru',
+    estimated_price: 650,
+    assignment_count: 1,
+    preferred_slot_start: new Date(Date.now() + 172800000).toISOString(),
+    status: 'open',
+  },
+];
+
+const demoSchedule = [];
+
+const demoEarnings = [
+  {
+    id: 'job-closed-001',
+    ticket_id: 'TKT-DEMO-DONE',
+    description: 'RO filter service completed',
+    service_address: 'Koramangala, Bengaluru',
+    closed_at: new Date(Date.now() - 86400000).toISOString(),
+    invoices: [{ total_amount: 950, payment_status: 'completed' }],
+  },
+];
 
 export default function CasaCareApp() {
   // Auth & Flow State
   const [authState, setAuthState] = useState('landing'); // landing | tier | phone | otp | profile | dashboard
-  const [userTier, setUserTier] = useState(null); // individual | nri | corporate | field_force
+  const [userTier, setUserTier] = useState(null); // individual | nri | corporate | staff_professional
   const [phoneNumber, setPhoneNumber] = useState('');
   const [otp, setOtp] = useState('');
   const [profile, setProfile] = useState({
@@ -19,62 +67,225 @@ export default function CasaCareApp() {
     address: '',
     city: '',
     zipCode: '',
-    kycDoc: null, // for NRI/Corporate
+    skills: [],
+    availability: 'available',
+    kycDoc: null, // for NRI/Corporate/Staff
   });
   const [currentUser, setCurrentUser] = useState(null);
+  const [currentProfile, setCurrentProfile] = useState(null);
+  const [activePanel, setActivePanel] = useState('overview');
+  const [customerRequests, setCustomerRequests] = useState([]);
+  const [availableJobs, setAvailableJobs] = useState([]);
+  const [mySchedule, setMySchedule] = useState([]);
+  const [earnings, setEarnings] = useState([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
 
+  const serviceOptions = SERVICE_CATEGORIES.filter((category) => category.id !== 'amc');
+
+  const routeAuthenticatedUser = useCallback(async (user) => {
+    if (!user) {
+      setCurrentUser(null);
+      setCurrentProfile(null);
+      setAuthState('landing');
+      return null;
+    }
+
+    setCurrentUser(user);
+    const { data: userProfile, error: profileError } = await supabase
+      .from('user_profiles')
+      .select('*')
+      .eq('user_id', user.id)
+      .maybeSingle();
+
+    if (profileError) {
+      setError(profileError.message || 'Failed to load your profile');
+      setAuthState('tier');
+      return null;
+    }
+
+    if (userProfile) {
+      let fieldAgent = null;
+      if (isProfessionalTier(userProfile.tier)) {
+        const { data: agentProfile } = await supabase
+          .from('field_agents')
+          .select('*')
+          .eq('user_id', user.id)
+          .maybeSingle();
+        fieldAgent = agentProfile;
+      }
+
+      const profileWithAgent = { ...userProfile, fieldAgent };
+      setCurrentProfile(profileWithAgent);
+      setUserTier(userProfile.tier);
+      setAuthState('dashboard');
+      return profileWithAgent;
+    }
+
+    setCurrentProfile(null);
+    setAuthState('tier');
+    return null;
+  }, []);
+
+  const loadDashboardData = useCallback(async (userProfile) => {
+    if (!userProfile) return;
+
+    if (getDashboardView(userProfile) === 'staff') {
+      const agentId = userProfile.fieldAgent?.id;
+      const [{ data: openJobs }, { data: scheduledJobs }, { data: completedJobs }] = await Promise.all([
+        supabase
+          .from('service_requests')
+          .select('*')
+          .eq('status', 'open')
+          .order('created_at', { ascending: true }),
+        agentId ? supabase
+          .from('service_requests')
+          .select('*')
+          .eq('assigned_agent_id', agentId)
+          .in('status', ['assigned', 'en_route', 'in_progress', 'awaiting_qc'])
+          .order('preferred_slot_start', { ascending: true }) : Promise.resolve({ data: [] }),
+        agentId ? supabase
+          .from('service_requests')
+          .select('*, invoices(total_amount, payment_status)')
+          .eq('assigned_agent_id', agentId)
+          .eq('status', 'closed')
+          .order('closed_at', { ascending: false }) : Promise.resolve({ data: [] }),
+      ]);
+
+      setAvailableJobs(openJobs || []);
+      setMySchedule(scheduledJobs || []);
+      setEarnings(completedJobs || []);
+      return;
+    }
+
+    const { data: requests } = await supabase
+      .from('service_requests')
+      .select('*')
+      .eq('user_id', userProfile.user_id)
+      .order('created_at', { ascending: false });
+
+    setCustomerRequests(requests || []);
+  }, []);
+
+  const acceptJob = async (job) => {
+    setLoading(true);
+    setError('');
+
+    try {
+      if (isDemoMode) {
+        const acceptedJob = {
+          ...job,
+          status: 'assigned',
+          assigned_agent_id: currentProfile.fieldAgent?.id || DEMO_AGENT_ID,
+          assignment_count: (job.assignment_count || 0) + 1,
+        };
+        setAvailableJobs((jobs) => jobs.filter((openJob) => openJob.id !== job.id));
+        setMySchedule((jobs) => [acceptedJob, ...jobs]);
+        setActivePanel('schedule');
+        setLoading(false);
+        return;
+      }
+
+      const { error: updateError } = await supabase
+        .from('service_requests')
+        .update({
+          status: 'assigned',
+          assigned_agent_id: currentProfile.fieldAgent?.id,
+          assignment_count: (job.assignment_count || 0) + 1,
+        })
+        .eq('id', job.id)
+        .eq('status', 'open');
+
+      if (updateError) throw updateError;
+      await loadDashboardData(currentProfile);
+      setActivePanel('schedule');
+    } catch (err) {
+      setError(err.message || 'Failed to accept job');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const createServiceRequest = async (category = 'plumbing') => {
+    setLoading(true);
+    setError('');
+
+    try {
+      const { error: insertError } = await supabase.from('service_requests').insert({
+        user_id: currentProfile.user_id,
+        category,
+        description: `New ${category.replace('_', ' ')} service request`,
+        service_address: currentProfile.address,
+        estimated_price: category === 'painting' ? 1200 : 800,
+      });
+
+      if (insertError) throw insertError;
+      await loadDashboardData(currentProfile);
+      setActivePanel('tracking');
+    } catch (err) {
+      setError(err.message || 'Failed to book service');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const refreshDashboard = async (panel) => {
+    setActivePanel(panel);
+    await loadDashboardData(currentProfile);
+  };
+
+  const seedDemoStaffDashboard = useCallback(async () => {
+    const demoProfile = {
+      user_id: DEMO_USER_ID,
+      tier: 'staff_professional',
+      full_name: 'Demo Professional',
+      email: 'demo.pro@casacare.local',
+      address: 'Casa Care Demo Zone',
+      city: 'Bengaluru',
+      skills: ['ac', 'plumbing'],
+      verification_status: 'submitted',
+      availability: 'available',
+      fieldAgent: {
+        id: DEMO_AGENT_ID,
+        availability_status: 'available',
+        rating: 4.8,
+        completed_jobs: 42,
+      },
+    };
+
+    setCurrentUser({ id: DEMO_USER_ID });
+    setCurrentProfile(demoProfile);
+    setUserTier('staff_professional');
+    setAvailableJobs(demoJobs);
+    setMySchedule(demoSchedule);
+    setEarnings(demoEarnings);
+    setAuthState('dashboard');
+    setActivePanel('jobs');
+  }, []);
+
   // Check if user is already logged in
   useEffect(() => {
-    // 1. Check for existing session on mount
+    if (isDemoMode) {
+      return undefined;
+    }
+
     const checkSession = async () => {
       const { data: { session } } = await supabase.auth.getSession();
-      if (session?.user) {
-        setCurrentUser(session.user);
-        // Fetch user profile from custom table
-        const { data: userProfile } = await supabase
-          .from('user_profiles')
-          .select('*')
-          .eq('user_id', session.user.id)
-          .single();
-        if (userProfile) {
-          setAuthState('dashboard');
-        } else {
-          setAuthState('tier');
-        }
-      }
+      const userProfile = await routeAuthenticatedUser(session?.user);
+      await loadDashboardData(userProfile);
     };
     
     checkSession();
 
-    // 2. Listen for auth state changes
     const { data: { subscription } } = supabase.auth.onAuthStateChange(async (event, session) => {
-      if (session?.user) {
-        setCurrentUser(session.user);
-        // Fetch user profile from custom table
-        const { data: userProfile } = await supabase
-          .from('user_profiles')
-          .select('*')
-          .eq('user_id', session.user.id)
-          .single();
-        if (userProfile) {
-          setAuthState('dashboard');
-        } else {
-          setAuthState('tier');
-        }
-      } else {
-        // Logged out
-        setCurrentUser(null);
-        setAuthState('landing');
-      }
+      const userProfile = await routeAuthenticatedUser(session?.user);
+      await loadDashboardData(userProfile);
     });
 
-    // 3. Cleanup subscription on unmount
     return () => {
       subscription?.unsubscribe();
     };
-  }, []);
+  }, [loadDashboardData, routeAuthenticatedUser]);
 
   // Step 1: Tier Selection
   const handleTierSelect = (tier) => {
@@ -97,6 +308,13 @@ export default function CasaCareApp() {
     }
 
     try {
+      // Demo mode bypass
+      if (isDemoMode) {
+        setAuthState('otp');
+        setLoading(false);
+        return;
+      }
+
       // Supabase OTP (using phone authentication)
       const { error: signUpError } = await supabase.auth.signInWithOtp({
         phone: `+91${cleanPhone}`,
@@ -118,6 +336,13 @@ export default function CasaCareApp() {
 
     try {
       const cleanPhone = phoneNumber.replace(/\D/g, '');
+      if (isDemoMode) {
+        setCurrentUser({ id: DEMO_USER_ID });
+        setAuthState('profile');
+        setLoading(false);
+        return;
+      }
+
       const { data, error: verifyError } = await supabase.auth.verifyOtp({
         phone: `+91${cleanPhone}`,
         token: otp,
@@ -147,22 +372,55 @@ export default function CasaCareApp() {
         return;
       }
 
-      // Create user profile in Supabase
-      const { error: insertError } = await supabase.from('user_profiles').insert({
-        user_id: currentUser.id,
-        phone: `+91${phoneNumber.replace(/\D/g, '')}`,
-        tier: userTier,
-        full_name: profile.fullName,
-        email: profile.email,
-        address: profile.address,
-        city: profile.city,
-        zip_code: profile.zipCode,
-        language: profile.language,
-        created_at: new Date(),
+      // Demo mode bypass
+      if (isDemoMode && isProfessionalTier(userTier)) {
+        seedDemoStaffDashboard();
+        setLoading(false);
+        return;
+      }
+
+      let kycDocPath = null;
+      if (profile.kycDoc) {
+        kycDocPath = buildKycStoragePath(currentUser.id, profile.kycDoc);
+        const { error: uploadError } = await supabase.storage
+          .from('kyc-documents')
+          .upload(kycDocPath, profile.kycDoc, { upsert: true });
+
+        if (uploadError) throw uploadError;
+      }
+
+      const profilePayload = buildProfilePayload({
+        currentUser,
+        phoneNumber,
+        userTier,
+        profile,
+        kycPath: kycDocPath,
       });
+
+      const { data: savedProfile, error: insertError } = await supabase
+        .from('user_profiles')
+        .insert(profilePayload)
+        .select()
+        .single();
 
       if (insertError) throw insertError;
 
+      if (isProfessionalTier(userTier)) {
+        const { error: agentError } = await supabase.from('field_agents').insert({
+          user_id: currentUser.id,
+          name: profile.fullName.trim(),
+          phone: `+91${phoneNumber.replace(/\D/g, '')}`,
+          email: profile.email.trim(),
+          categories: profile.skills,
+          availability_status: profile.availability,
+          background_check_passed: false,
+        });
+
+        if (agentError) throw agentError;
+      }
+
+      setCurrentProfile(savedProfile);
+      await loadDashboardData(savedProfile);
       setAuthState('dashboard');
     } catch (err) {
       setError(err.message || 'Failed to create account');
@@ -192,6 +450,15 @@ export default function CasaCareApp() {
           >
             Get Started
           </button>
+          {isDemoMode && (
+            <button
+              type="button"
+              onClick={seedDemoStaffDashboard}
+              style={{ ...styles.backButton, marginBottom: '20px' }}
+            >
+              Launch Staff Demo
+            </button>
+          )}
           <p style={styles.footerText}>
             Available for AC, RO, plumbing, carpentry, painting, and more.
           </p>
@@ -206,13 +473,13 @@ export default function CasaCareApp() {
       <div style={styles.container}>
         <div style={styles.formCard}>
           <h2 style={styles.formTitle}>Who are you?</h2>
-          <p style={styles.formSubtitle}>Select the option that fits you best</p>
+          <p style={styles.formSubtitle}>Choose whether you need care or provide home services.</p>
           <div style={styles.tierGrid}>
             {[
               { id: 'individual', label: 'Individual', desc: 'Homeowner or tenant' },
               { id: 'nri', label: 'NRI Owner', desc: 'Managing property abroad' },
               { id: 'corporate', label: 'Corporate HQ', desc: 'Office or multiple locations' },
-              { id: 'field_force', label: 'Field Force', desc: 'Service partner' },
+              { id: 'staff_professional', label: 'Staff / Professional', desc: 'Find jobs and manage earnings' },
             ].map((tier) => (
               <button
                 key={tier.id}
@@ -404,9 +671,53 @@ export default function CasaCareApp() {
                 />
               </div>
             </div>
-            {userTier === 'nri' && (
+            {isProfessionalTier(userTier) && (
+              <>
+                <div style={styles.formGroup}>
+                  <label style={styles.label}>Skills / Category</label>
+                  <div style={styles.checkboxGrid}>
+                    {serviceOptions.map((category) => (
+                      <label key={category.id} style={styles.checkboxLabel}>
+                        <input
+                          type="checkbox"
+                          checked={profile.skills.includes(category.id)}
+                          onChange={(e) => {
+                            const nextSkills = e.target.checked
+                              ? [...profile.skills, category.id]
+                              : profile.skills.filter((skill) => skill !== category.id);
+                            setProfile({ ...profile, skills: nextSkills });
+                          }}
+                        />
+                        {category.label}
+                      </label>
+                    ))}
+                  </div>
+                </div>
+                <div style={styles.formGroup}>
+                  <label style={styles.label}>Availability</label>
+                  <select
+                    value={profile.availability}
+                    onChange={(e) => setProfile({ ...profile, availability: e.target.value })}
+                    style={styles.input}
+                  >
+                    <option value="available">Available now</option>
+                    <option value="busy">Busy</option>
+                    <option value="offline">Offline</option>
+                  </select>
+                </div>
+                <div style={styles.infoBox}>
+                  <div style={styles.infoBadge}>Verification status</div>
+                  <p style={styles.infoText}>
+                    Upload your document to submit verification. New professionals start as pending until Casa Care verifies the profile.
+                  </p>
+                </div>
+              </>
+            )}
+            {(userTier === 'nri' || userTier === 'corporate' || isProfessionalTier(userTier)) && (
               <div style={styles.formGroup}>
-                <label style={styles.label}>KYC Document (Passport / OCI)</label>
+                <label style={styles.label}>
+                  {isProfessionalTier(userTier) ? 'KYC Document (ID proof / Certification)' : 'KYC Document (Passport / OCI)'}
+                </label>
                 <input
                   type="file"
                   accept="image/*, .pdf"
@@ -434,6 +745,123 @@ export default function CasaCareApp() {
 
   // ============ DASHBOARD ============
   if (authState === 'dashboard' && currentUser) {
+    const dashboardView = getDashboardView(currentProfile);
+
+    if (dashboardView === 'staff') {
+      return (
+        <div style={styles.container}>
+          <div style={styles.dashboard}>
+            <div style={styles.dashboardHeader}>
+              <div style={styles.logo}>
+                <div style={styles.logoMark}>C</div>
+                <div>
+                  <div style={styles.logoName}>Casa Care Pro</div>
+                </div>
+              </div>
+              <button
+                onClick={() => {
+                  supabase.auth.signOut();
+                  setAuthState('landing');
+                  setCurrentUser(null);
+                  setCurrentProfile(null);
+                }}
+                style={styles.logoutButton}
+              >
+                Sign Out
+              </button>
+            </div>
+
+            <div style={styles.welcomeSection}>
+              <h2 style={styles.dashboardTitle}>Staff Dashboard</h2>
+              <p style={styles.dashboardSubtitle}>
+                Find local jobs, manage accepted appointments, and track payouts.
+              </p>
+              <div style={styles.statusRow}>
+                <span style={styles.statusPill}>Verification: {currentProfile?.verification_status || 'pending'}</span>
+                <span style={styles.statusPill}>Availability: {currentProfile?.availability || 'offline'}</span>
+                <span style={styles.statusPill}>Skills: {(currentProfile?.skills || []).join(', ') || 'Not set'}</span>
+              </div>
+            </div>
+
+            {error && <div style={styles.error}>{error}</div>}
+
+            <div style={styles.cardGrid}>
+              <button onClick={() => refreshDashboard('jobs')} style={styles.metricCard}>
+                <div style={styles.metricValue}>{availableJobs.length}</div>
+                <div style={styles.cardTitle}>Available Jobs</div>
+                <p style={styles.cardDesc}>Local service requests waiting for providers.</p>
+              </button>
+              <button onClick={() => refreshDashboard('schedule')} style={styles.metricCard}>
+                <div style={styles.metricValue}>{mySchedule.length}</div>
+                <div style={styles.cardTitle}>My Schedule</div>
+                <p style={styles.cardDesc}>Accepted tasks and upcoming appointments.</p>
+              </button>
+              <button onClick={() => refreshDashboard('earnings')} style={styles.metricCard}>
+                <div style={styles.metricValue}>₹{earnings.reduce((sum, job) => sum + Number(job.invoices?.[0]?.total_amount || 0), 0)}</div>
+                <div style={styles.cardTitle}>Earnings</div>
+                <p style={styles.cardDesc}>Completed jobs and payout status.</p>
+              </button>
+            </div>
+
+            <div style={styles.sectionCard}>
+              <h3 style={styles.sectionTitle}>Available Jobs</h3>
+              {availableJobs.length === 0 ? (
+                <p style={styles.cardDesc}>No open jobs match your area right now.</p>
+              ) : (
+                availableJobs.map((job) => (
+                  <div key={job.id} style={styles.jobRow}>
+                    <div>
+                      <div style={styles.cardTitle}>{job.ticket_id}</div>
+                      <p style={styles.cardDesc}>{job.description}</p>
+                      <p style={styles.cardDesc}>{job.service_address} · ₹{job.estimated_price || 0}</p>
+                    </div>
+                    <button onClick={() => acceptJob(job)} disabled={loading} style={styles.cardButton}>
+                      Accept Job
+                    </button>
+                  </div>
+                ))
+              )}
+            </div>
+
+            <div style={styles.sectionCard}>
+              <h3 style={styles.sectionTitle}>My Schedule</h3>
+              {mySchedule.length === 0 ? (
+                <p style={styles.cardDesc}>Accepted work appears here.</p>
+              ) : (
+                mySchedule.map((job) => (
+                  <div key={job.id} style={styles.jobRow}>
+                    <div>
+                      <div style={styles.cardTitle}>{job.ticket_id}</div>
+                      <p style={styles.cardDesc}>{job.description}</p>
+                      <p style={styles.cardDesc}>Status: {job.status}</p>
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
+
+            <div style={styles.sectionCard}>
+              <h3 style={styles.sectionTitle}>Earnings</h3>
+              {earnings.length === 0 ? (
+                <p style={styles.cardDesc}>Completed jobs and payout status appear here.</p>
+              ) : (
+                earnings.map((job) => (
+                  <div key={job.id} style={styles.jobRow}>
+                    <div>
+                      <div style={styles.cardTitle}>{job.ticket_id}</div>
+                      <p style={styles.cardDesc}>
+                        ₹{job.invoices?.[0]?.total_amount || 0} · {job.invoices?.[0]?.payment_status || 'pending'}
+                      </p>
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+        </div>
+      );
+    }
+
     return (
       <div style={styles.container}>
         <div style={styles.dashboard}>
@@ -777,6 +1205,71 @@ const styles = {
     borderRadius: '4px',
     cursor: 'pointer',
     transition: 'background 0.2s',
+  },
+  metricCard: {
+    background: '#ffffff',
+    padding: '20px',
+    borderRadius: '8px',
+    border: '1px solid #e8dfce',
+    textAlign: 'left',
+    cursor: 'pointer',
+    minHeight: '132px',
+  },
+  metricValue: {
+    display: 'block',
+    fontSize: '30px',
+    fontWeight: '700',
+    color: '#0e4c5c',
+    marginBottom: '10px',
+    lineHeight: '1',
+  },
+  statusRow: {
+    display: 'flex',
+    flexWrap: 'wrap',
+    gap: '8px',
+    marginTop: '16px',
+  },
+  statusPill: {
+    display: 'inline-flex',
+    alignItems: 'center',
+    background: '#ffffff',
+    border: '1px solid #d9cdc0',
+    borderRadius: '999px',
+    padding: '6px 10px',
+    fontSize: '12px',
+    fontWeight: '600',
+    color: '#2a2620',
+  },
+  sectionCard: {
+    background: '#ffffff',
+    border: '1px solid #e8dfce',
+    borderRadius: '8px',
+    padding: '20px',
+    marginBottom: '24px',
+  },
+  sectionTitle: {
+    fontSize: '22px',
+    fontFamily: '"Fraunces", serif',
+    margin: '0 0 16px',
+  },
+  jobRow: {
+    display: 'flex',
+    justifyContent: 'space-between',
+    gap: '16px',
+    alignItems: 'center',
+    borderTop: '1px solid #f0e9dc',
+    padding: '14px 0',
+  },
+  checkboxGrid: {
+    display: 'grid',
+    gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))',
+    gap: '8px',
+  },
+  checkboxLabel: {
+    display: 'flex',
+    gap: '8px',
+    alignItems: 'center',
+    fontSize: '13px',
   },
   infoBox: {
     background: '#e1eaec',
