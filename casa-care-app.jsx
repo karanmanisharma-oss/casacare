@@ -9,6 +9,7 @@ const supabase = createClient(supabaseUrl, supabaseKey);
 export default function CasaCareApp() {
   // Auth & Flow State
   const [authState, setAuthState] = useState('landing'); // landing | tier | phone | otp | profile | dashboard
+  const [signupRole, setSignupRole] = useState('customer'); // customer | staff
   const [userTier, setUserTier] = useState(null); // individual | nri | corporate | field_force
   const [phoneNumber, setPhoneNumber] = useState('');
   const [otp, setOtp] = useState('');
@@ -22,27 +23,72 @@ export default function CasaCareApp() {
     kycDoc: null, // for NRI/Corporate
   });
   const [currentUser, setCurrentUser] = useState(null);
+  const [userProfile, setUserProfile] = useState(null);
+  const [availableGigs, setAvailableGigs] = useState([]);
+  const [activeJobs, setActiveJobs] = useState([]);
+  const [jobsLoading, setJobsLoading] = useState(false);
+  const [claimingJobId, setClaimingJobId] = useState(null);
+  const [dashboardMessage, setDashboardMessage] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+  const isSigningUp = ['phone', 'otp', 'profile'].includes(authState);
+
+  const fetchUserProfile = async (userId) => {
+    const { data: fetchedProfile } = await supabase
+      .from('user_profiles')
+      .select('*')
+      .eq('user_id', userId)
+      .single();
+
+    setUserProfile(fetchedProfile || null);
+    return fetchedProfile;
+  };
+
+  const fetchStaffJobs = async (userId) => {
+    setJobsLoading(true);
+    setDashboardMessage('');
+
+    const columns = 'id,ticket_id,category,status,description,service_address,estimated_price,preferred_slot_start,created_at,assigned_to';
+    const [{ data: pendingJobs, error: pendingError }, { data: assignedJobs, error: assignedError }] = await Promise.all([
+      supabase
+        .from('service_requests')
+        .select(columns)
+        .eq('status', 'pending')
+        .is('assigned_to', null)
+        .order('created_at', { ascending: true }),
+      supabase
+        .from('service_requests')
+        .select(columns)
+        .eq('assigned_to', userId)
+        .in('status', ['assigned', 'en_route', 'in_progress', 'awaiting_qc', 'rework'])
+        .order('created_at', { ascending: false }),
+    ]);
+
+    if (pendingError || assignedError) {
+      setDashboardMessage(pendingError?.message || assignedError?.message || 'Unable to load jobs');
+    }
+
+    setAvailableGigs(pendingJobs || []);
+    setActiveJobs(assignedJobs || []);
+    setJobsLoading(false);
+  };
 
   // Check if user is already logged in
   useEffect(() => {
+    let isActive = true;
+
+    const routeAuthenticatedUser = async (sessionUser) => {
+      setCurrentUser(sessionUser);
+      const fetchedProfile = await fetchUserProfile(sessionUser.id);
+      if (!isActive) return;
+      setAuthState(fetchedProfile ? 'dashboard' : 'tier');
+    };
+
     // 1. Check for existing session on mount
     const checkSession = async () => {
       const { data: { session } } = await supabase.auth.getSession();
       if (session?.user) {
-        setCurrentUser(session.user);
-        // Fetch user profile from custom table
-        const { data: userProfile } = await supabase
-          .from('user_profiles')
-          .select('*')
-          .eq('user_id', session.user.id)
-          .single();
-        if (userProfile) {
-          setAuthState('dashboard');
-        } else {
-          setAuthState('tier');
-        }
+        await routeAuthenticatedUser(session.user);
       }
     };
     
@@ -50,36 +96,39 @@ export default function CasaCareApp() {
 
     // 2. Listen for auth state changes
     const { data: { subscription } } = supabase.auth.onAuthStateChange(async (event, session) => {
+      if (!isActive) return;
+
+      if (event === 'SIGNED_IN' && isSigningUp) {
+        return;
+      }
+
       if (session?.user) {
-        setCurrentUser(session.user);
-        // Fetch user profile from custom table
-        const { data: userProfile } = await supabase
-          .from('user_profiles')
-          .select('*')
-          .eq('user_id', session.user.id)
-          .single();
-        if (userProfile) {
-          setAuthState('dashboard');
-        } else {
-          setAuthState('tier');
-        }
+        await routeAuthenticatedUser(session.user);
       } else {
         // Logged out
         setCurrentUser(null);
+        setUserProfile(null);
         setAuthState('landing');
       }
     });
 
     // 3. Cleanup subscription on unmount
     return () => {
+      isActive = false;
       subscription?.unsubscribe();
     };
-  }, []);
+  }, [isSigningUp]);
 
   // Step 1: Tier Selection
   const handleTierSelect = (tier) => {
     setUserTier(tier);
     setAuthState('phone');
+  };
+
+  const handleRoleSelect = (role) => {
+    setSignupRole(role);
+    setUserTier(role === 'staff' ? 'field_force' : null);
+    setError('');
   };
 
   // Step 2: Phone Number Submission
@@ -147,10 +196,28 @@ export default function CasaCareApp() {
         return;
       }
 
+      if ((signupRole === 'staff' || userTier === 'nri') && !profile.kycDoc) {
+        setError('Please upload your KYC document before creating the account');
+        setLoading(false);
+        return;
+      }
+
+      let kycDocUrl = null;
+      if (profile.kycDoc) {
+        const kycPath = `${currentUser.id}/${Date.now()}-${profile.kycDoc.name.replace(/[^a-zA-Z0-9._-]/g, '-')}`;
+        const { data: uploadedKyc, error: uploadError } = await supabase.storage
+          .from('kyc-documents')
+          .upload(kycPath, profile.kycDoc, { upsert: false });
+
+        if (uploadError) throw uploadError;
+        kycDocUrl = uploadedKyc?.path || kycPath;
+      }
+
       // Create user profile in Supabase
       const { error: insertError } = await supabase.from('user_profiles').insert({
         user_id: currentUser.id,
         phone: `+91${phoneNumber.replace(/\D/g, '')}`,
+        role: signupRole,
         tier: userTier,
         full_name: profile.fullName,
         email: profile.email,
@@ -158,17 +225,84 @@ export default function CasaCareApp() {
         city: profile.city,
         zip_code: profile.zipCode,
         language: profile.language,
+        kyc_doc_url: kycDocUrl,
         created_at: new Date(),
       });
 
       if (insertError) throw insertError;
 
+      await fetchUserProfile(currentUser.id);
       setAuthState('dashboard');
     } catch (err) {
       setError(err.message || 'Failed to create account');
     }
     setLoading(false);
   };
+
+  const handleClaimJob = async (jobId) => {
+    setClaimingJobId(jobId);
+    setDashboardMessage('');
+
+    const { data: claimedRows, error: claimError } = await supabase
+      .rpc('claim_service_request', { request_id: jobId });
+
+    if (claimError) {
+      setDashboardMessage(claimError.message || 'Unable to claim job');
+    } else if (!claimedRows?.length) {
+      setDashboardMessage('This job was already claimed. Refreshing available gigs.');
+      await fetchStaffJobs(currentUser.id);
+    } else {
+      setDashboardMessage('Job claimed. It is now in Active Jobs.');
+      await fetchStaffJobs(currentUser.id);
+    }
+
+    setClaimingJobId(null);
+  };
+
+  useEffect(() => {
+    if (authState === 'dashboard' && currentUser && userProfile?.role === 'staff') {
+      fetchStaffJobs(currentUser.id);
+    }
+  }, [authState, currentUser, userProfile?.role]);
+
+  const isStaff = userProfile?.role === 'staff';
+  const walletTotal = activeJobs.reduce((total, job) => total + Number(job.estimated_price || 0), 0);
+
+  const formatJobMeta = (job) => {
+    const price = job.estimated_price ? `₹${Number(job.estimated_price).toLocaleString('en-IN')}` : 'Quote pending';
+    return `${job.category?.toUpperCase() || 'SERVICE'} · ${price}`;
+  };
+
+  const renderJobCard = (job, showClaimButton = false) => (
+    <div key={job.id} style={styles.jobCard}>
+      <div style={styles.jobHeader}>
+        <div>
+          <div style={styles.jobTicket}>{job.ticket_id || 'New request'}</div>
+          <div style={styles.jobMeta}>{formatJobMeta(job)}</div>
+        </div>
+        <span style={styles.statusPill}>{job.status}</span>
+      </div>
+      <p style={styles.jobDescription}>{job.description || 'Customer has not added extra details yet.'}</p>
+      <div style={styles.jobAddress}>{job.service_address}</div>
+      {showClaimButton && (
+        <button
+          onClick={() => handleClaimJob(job.id)}
+          disabled={claimingJobId === job.id}
+          style={{
+            ...styles.cardButton,
+            ...styles.claimButton,
+            opacity: claimingJobId === job.id ? 0.6 : 1,
+          }}
+        >
+          {claimingJobId === job.id ? 'Claiming...' : 'Claim Job'}
+        </button>
+      )}
+    </div>
+  );
+
+  const renderEmptyState = (message) => (
+    <div style={styles.emptyState}>{message}</div>
+  );
 
   // ============ LANDING PAGE ============
   if (authState === 'landing') {
@@ -202,33 +336,61 @@ export default function CasaCareApp() {
 
   // ============ TIER SELECTION ============
   if (authState === 'tier') {
+    const accountTypes = [
+      { id: 'customer', label: 'I need a service', desc: 'Book and track trusted home services' },
+      { id: 'staff', label: 'I am a Professional (Staff)', desc: 'Claim gigs and manage earnings' },
+    ];
+    const customerTiers = [
+      { id: 'individual', label: 'Individual', desc: 'Homeowner or tenant' },
+      { id: 'nri', label: 'NRI Owner', desc: 'Managing property abroad' },
+      { id: 'corporate', label: 'Corporate HQ', desc: 'Office or multiple locations' },
+    ];
+
     return (
       <div style={styles.container}>
         <div style={styles.formCard}>
           <h2 style={styles.formTitle}>Who are you?</h2>
-          <p style={styles.formSubtitle}>Select the option that fits you best</p>
+          <p style={styles.formSubtitle}>Choose how you want to use Casa Care</p>
           <div style={styles.tierGrid}>
-            {[
-              { id: 'individual', label: 'Individual', desc: 'Homeowner or tenant' },
-              { id: 'nri', label: 'NRI Owner', desc: 'Managing property abroad' },
-              { id: 'corporate', label: 'Corporate HQ', desc: 'Office or multiple locations' },
-              { id: 'field_force', label: 'Field Force', desc: 'Service partner' },
-            ].map((tier) => (
+            {accountTypes.map((roleOption) => (
               <button
-                key={tier.id}
-                onClick={() => handleTierSelect(tier.id)}
+                key={roleOption.id}
+                onClick={() => handleRoleSelect(roleOption.id)}
                 style={{
                   ...styles.tierCard,
-                  backgroundColor: userTier === tier.id ? '#0e4c5c' : '#f8f4ed',
-                  color: userTier === tier.id ? '#f8f4ed' : '#14110d',
+                  backgroundColor: signupRole === roleOption.id ? '#0e4c5c' : '#f8f4ed',
+                  color: signupRole === roleOption.id ? '#f8f4ed' : '#14110d',
                 }}
               >
-                <div style={styles.tierLabel}>{tier.label}</div>
-                <div style={styles.tierDesc}>{tier.desc}</div>
+                <div style={styles.tierLabel}>{roleOption.label}</div>
+                <div style={styles.tierDesc}>{roleOption.desc}</div>
               </button>
             ))}
           </div>
-          {userTier && (
+
+          {signupRole === 'customer' && (
+            <>
+              <p style={styles.formSubtitle}>Select the service account type that fits you best</p>
+              <div style={styles.tierGrid}>
+                {customerTiers.map((tier) => (
+                  <button
+                    key={tier.id}
+                    onClick={() => handleTierSelect(tier.id)}
+                    style={{
+                      ...styles.tierCard,
+                      backgroundColor: userTier === tier.id ? '#0e4c5c' : '#f8f4ed',
+                      color: userTier === tier.id ? '#f8f4ed' : '#14110d',
+                    }}
+                  >
+                    <div style={styles.tierLabel}>{tier.label}</div>
+                    <div style={styles.tierDesc}>{tier.desc}</div>
+                  </button>
+                ))}
+              </div>
+            </>
+          )}
+
+          {(signupRole === 'staff' || userTier) && (
             <button
               onClick={() => setAuthState('phone')}
               style={styles.nextButton}
@@ -404,9 +566,11 @@ export default function CasaCareApp() {
                 />
               </div>
             </div>
-            {userTier === 'nri' && (
+            {(signupRole === 'staff' || userTier === 'nri') && (
               <div style={styles.formGroup}>
-                <label style={styles.label}>KYC Document (Passport / OCI)</label>
+                <label style={styles.label}>
+                  KYC Document {signupRole === 'staff' ? '(ID / Certification) *' : '(Passport / OCI)'}
+                </label>
                 <input
                   type="file"
                   accept="image/*, .pdf"
@@ -449,6 +613,7 @@ export default function CasaCareApp() {
                 supabase.auth.signOut();
                 setAuthState('landing');
                 setCurrentUser(null);
+                setUserProfile(null);
               }}
               style={styles.logoutButton}
             >
@@ -457,43 +622,107 @@ export default function CasaCareApp() {
           </div>
 
           <div style={styles.welcomeSection}>
-            <h2 style={styles.dashboardTitle}>Welcome back!</h2>
-            <p style={styles.dashboardSubtitle}>Your account is active and ready to book services.</p>
-          </div>
-
-          <div style={styles.cardGrid}>
-            <div style={styles.card}>
-              <div style={styles.cardIcon}>📝</div>
-              <div style={styles.cardTitle}>Book a Service</div>
-              <p style={styles.cardDesc}>AC, RO, plumbing, carpentry, painting & more</p>
-              <button style={styles.cardButton}>Browse Services</button>
-            </div>
-            <div style={styles.card}>
-              <div style={styles.cardIcon}>📱</div>
-              <div style={styles.cardTitle}>Track Orders</div>
-              <p style={styles.cardDesc}>Live tracking of your service requests</p>
-              <button style={styles.cardButton}>View Active Jobs</button>
-            </div>
-            <div style={styles.card}>
-              <div style={styles.cardIcon}>⭐</div>
-              <div style={styles.cardTitle}>Your Assets</div>
-              <p style={styles.cardDesc}>Scan QR to see service history</p>
-              <button style={styles.cardButton}>View Assets</button>
-            </div>
-            <div style={styles.card}>
-              <div style={styles.cardIcon}>📊</div>
-              <div style={styles.cardTitle}>Wallet & History</div>
-              <p style={styles.cardDesc}>Invoices, payments & spending</p>
-              <button style={styles.cardButton}>View History</button>
-            </div>
-          </div>
-
-          <div style={styles.infoBox}>
-            <div style={styles.infoBadge}>ℹ️ You're all set</div>
-            <p style={styles.infoText}>
-              Your account is verified and ready. Book your first service now to get started with Casa Care's verified technicians and transparent pricing.
+            <h2 style={styles.dashboardTitle}>{isStaff ? 'Staff workspace' : 'Welcome back!'}</h2>
+            <p style={styles.dashboardSubtitle}>
+              {isStaff
+                ? 'Review open customer requests, claim work, and track your Casa Care earnings.'
+                : 'Your account is active and ready to book services.'}
             </p>
           </div>
+
+          {isStaff ? (
+            <>
+              <div style={styles.staffStatsGrid}>
+                <div style={styles.statCard}>
+                  <div style={styles.statLabel}>Available Gigs</div>
+                  <div style={styles.statValue}>{availableGigs.length}</div>
+                </div>
+                <div style={styles.statCard}>
+                  <div style={styles.statLabel}>Active Jobs</div>
+                  <div style={styles.statValue}>{activeJobs.length}</div>
+                </div>
+                <div style={styles.statCard}>
+                  <div style={styles.statLabel}>Wallet</div>
+                  <div style={styles.statValue}>₹{walletTotal.toLocaleString('en-IN')}</div>
+                </div>
+              </div>
+
+              {dashboardMessage && <div style={styles.infoBox}>{dashboardMessage}</div>}
+
+              <section style={styles.dashboardSection}>
+                <div style={styles.sectionHeader}>
+                  <h3 style={styles.sectionTitle}>Available Gigs</h3>
+                  <button
+                    onClick={() => fetchStaffJobs(currentUser.id)}
+                    style={styles.cardButton}
+                  >
+                    {jobsLoading ? 'Refreshing...' : 'Refresh'}
+                  </button>
+                </div>
+                {availableGigs.length > 0 ? (
+                  <div style={styles.jobList}>
+                    {availableGigs.map((job) => renderJobCard(job, true))}
+                  </div>
+                ) : (
+                  <p style={styles.emptyText}>No pending service requests are available right now.</p>
+                )}
+              </section>
+
+              <section style={styles.dashboardSection}>
+                <h3 style={styles.sectionTitle}>Active Jobs</h3>
+                {activeJobs.length > 0 ? (
+                  <div style={styles.jobList}>
+                    {activeJobs.map((job) => renderJobCard(job))}
+                  </div>
+                ) : (
+                  <p style={styles.emptyText}>Claim a gig to start building your active queue.</p>
+                )}
+              </section>
+
+              <section style={styles.infoBox}>
+                <div style={styles.infoBadge}>Wallet</div>
+                <p style={styles.infoText}>
+                  Estimated earnings from active jobs: ₹{walletTotal.toLocaleString('en-IN')}. Completed payouts can be reconciled once invoice settlement is connected.
+                </p>
+              </section>
+            </>
+          ) : (
+            <>
+              <div style={styles.cardGrid}>
+                <div style={styles.card}>
+                  <div style={styles.cardIcon}>📝</div>
+                  <div style={styles.cardTitle}>Book a Service</div>
+                  <p style={styles.cardDesc}>AC, RO, plumbing, carpentry, painting & more</p>
+                  <button style={styles.cardButton}>Browse Services</button>
+                </div>
+                <div style={styles.card}>
+                  <div style={styles.cardIcon}>📱</div>
+                  <div style={styles.cardTitle}>Track Orders</div>
+                  <p style={styles.cardDesc}>Live tracking of your service requests</p>
+                  <button style={styles.cardButton}>View Active Jobs</button>
+                </div>
+                <div style={styles.card}>
+                  <div style={styles.cardIcon}>⭐</div>
+                  <div style={styles.cardTitle}>Your Assets</div>
+                  <p style={styles.cardDesc}>Scan QR to see service history</p>
+                  <button style={styles.cardButton}>View Assets</button>
+                </div>
+                <div style={styles.card}>
+                  <div style={styles.cardIcon}>📊</div>
+                  <div style={styles.cardTitle}>Wallet & History</div>
+                  <p style={styles.cardDesc}>Invoices, payments & spending</p>
+                  <button style={styles.cardButton}>View History</button>
+                </div>
+              </div>
+
+              <div style={styles.infoBox}>
+                <div style={styles.infoBadge}>ℹ️ You're all set</div>
+                <p style={styles.infoText}>
+                  Your account is verified and ready. Book your first service now to get started with Casa Care's verified technicians and transparent pricing.
+                </p>
+              </div>
+            </>
+          )}
         </div>
       </div>
     );
@@ -808,5 +1037,103 @@ const styles = {
     borderRadius: '4px',
     cursor: 'pointer',
     color: '#14110d',
+  },
+  staffStatsGrid: {
+    display: 'grid',
+    gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))',
+    gap: '16px',
+    marginBottom: '28px',
+  },
+  statCard: {
+    background: '#ffffff',
+    border: '1px solid #e8dfce',
+    borderRadius: '6px',
+    padding: '18px',
+  },
+  statLabel: {
+    fontSize: '12px',
+    color: '#6b6357',
+    fontWeight: '600',
+    textTransform: 'uppercase',
+    letterSpacing: '0.08em',
+    marginBottom: '8px',
+  },
+  statValue: {
+    fontSize: '28px',
+    fontFamily: '"Fraunces", serif',
+    fontWeight: '600',
+  },
+  dashboardSection: {
+    marginBottom: '32px',
+  },
+  sectionHeader: {
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: '16px',
+    marginBottom: '12px',
+  },
+  sectionTitle: {
+    fontSize: '20px',
+    fontFamily: '"Fraunces", serif',
+    fontWeight: '500',
+    margin: '0 0 12px',
+  },
+  jobList: {
+    display: 'grid',
+    gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))',
+    gap: '16px',
+  },
+  jobCard: {
+    background: '#ffffff',
+    border: '1px solid #e8dfce',
+    borderRadius: '6px',
+    padding: '18px',
+  },
+  jobHeader: {
+    display: 'flex',
+    justifyContent: 'space-between',
+    alignItems: 'flex-start',
+    gap: '12px',
+    marginBottom: '12px',
+  },
+  jobTicket: {
+    fontSize: '15px',
+    fontWeight: '700',
+  },
+  jobMeta: {
+    fontSize: '12px',
+    color: '#6b6357',
+    marginTop: '4px',
+  },
+  statusPill: {
+    background: '#e1eaec',
+    color: '#0e4c5c',
+    borderRadius: '999px',
+    padding: '4px 8px',
+    fontSize: '11px',
+    fontWeight: '700',
+    textTransform: 'uppercase',
+  },
+  jobDescription: {
+    fontSize: '14px',
+    color: '#2a2620',
+    lineHeight: '1.5',
+    margin: '0 0 12px',
+  },
+  jobAddress: {
+    fontSize: '13px',
+    color: '#6b6357',
+    marginBottom: '14px',
+  },
+  claimButton: {
+    background: '#0e4c5c',
+    color: '#f8f4ed',
+    borderColor: '#0e4c5c',
+  },
+  emptyText: {
+    color: '#6b6357',
+    fontSize: '14px',
+    margin: '0',
   },
 };
